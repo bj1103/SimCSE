@@ -559,6 +559,9 @@ def main():
 
             # Need to save the state, since Trainer.save_model saves only the tokenizer with the model
             trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
+        metrics = trainer.evaluate()
+        logger.info(metrics)
+        trainer._save_checkpoint(trainer.model, None, metrics)
 
     # Evaluation
     results = {}

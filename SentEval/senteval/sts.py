@@ -108,7 +108,10 @@ class STSEval(object):
             Spearman = %.4f' % (wavg_pearson, wavg_spearman))
         logging.debug('ALL (average) : Pearson = %.4f, \
             Spearman = %.4f\n' % (avg_pearson, avg_spearman))
-
+        # all_sys_scores = np.array(all_sys_scores)
+        # np.save('STSB-Bert-BT.npy', all_sys_scores)
+        # all_gs_scores = np.array(all_gs_scores)
+        # np.save('STSB-ground-.npy', all_gs_scores)
         return results
 
 

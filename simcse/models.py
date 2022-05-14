@@ -82,6 +82,25 @@ class Pooler(nn.Module):
         else:
             raise NotImplementedError
 
+class Projector(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size * 4),
+            nn.BatchNorm1d(config.hidden_size * 4),
+            nn.ReLU(True),
+            nn.Linear(config.hidden_size * 4, config.hidden_size * 4),
+        )
+
+    def forward(self, features, **kwargs):
+        x = self.dense(features)
+        return x
+
+def off_diagonal(x):
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
 
 def cl_init(cls, config):
     """
@@ -92,6 +111,7 @@ def cl_init(cls, config):
     if cls.model_args.pooler_type == "cls":
         cls.mlp = MLPLayer(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
+    cls.projector = Projector(config)
     cls.init_weights()
 
 def cl_forward(cls,
@@ -162,6 +182,8 @@ def cl_forward(cls,
 
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
+    z1 = cls.projector(z1)
+    z2 = cls.projector(z2)
 
     # Hard negative
     if num_sent == 3:
@@ -197,8 +219,8 @@ def cl_forward(cls,
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
         cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
 
-    labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    loss_fct = nn.CrossEntropyLoss()
+    # labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
+    # loss_fct = nn.CrossEntropyLoss()
 
     # Calculate loss with hard negatives
     if num_sent == 3:
@@ -209,8 +231,49 @@ def cl_forward(cls,
         ).to(cls.device)
         cos_sim = cos_sim + weights
 
-    loss = loss_fct(cos_sim, labels)
+    # loss = loss_fct(cos_sim, labels)
 
+    ### --- VICReg ---
+    # repr_loss = F.mse_loss(z1, z2)
+
+    # z1 = z1 - z1.mean(dim=0)
+    # z2 = z2 - z2.mean(dim=0)
+
+    # std_z1 = torch.sqrt(z1.var(dim=0) + 0.0001)
+    # std_z2 = torch.sqrt(z2.var(dim=0) + 0.0001)
+    # std_loss = torch.mean(F.relu(1 - std_z1)) / 2 + torch.mean(F.relu(1 - std_z2)) / 2
+
+    # num_features = z1.shape[-1]
+    # cov_z1 = (z1.T @ z1) / (batch_size - 1)
+    # cov_z2 = (z2.T @ z2) / (batch_size - 1)
+    # cov_loss = off_diagonal(cov_z1).pow_(2).sum().div(
+    #     num_features
+    # ) + off_diagonal(cov_z2).pow_(2).sum().div(num_features)
+    # loss = 25.0 * repr_loss + 25.0 * std_loss + 1.0 * cov_loss
+    # cl_forward.step += 1
+    # if cl_forward.step % 125 == 0:
+    #     print(f"invariance : {repr_loss}, variance : {std_loss}, covariance : {cov_loss}", flush=True, end='')
+    ### --- VICReg ---
+
+    ### --- Barlow Twins ---
+    N, D = z1.size()
+    bn = torch.nn.BatchNorm1d(D, affine=False).to(z1.device)
+    c = bn(z1).T @ bn(z2)
+    c.div_(batch_size)
+    # c.div_(cls.model_args.temp)
+    if cl_forward.step % 125 == 0:
+        print(c)
+        print(cos_sim)
+    on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+    off_diag = off_diagonal(c).pow_(2).sum()
+    loss = on_diag + 0.03 * off_diag
+    loss *= 0.001
+
+    cl_forward.step += 1
+    if cl_forward.step % 125 == 0:
+        print({'on_diag' : on_diag.item(), 'off_diag' : off_diag.item(), 'weighted' : loss.item()})
+    ### --- Barlow Twins ---
+    
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
@@ -387,3 +450,4 @@ class RobertaForCL(RobertaPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
             )
+cl_forward.step = 0

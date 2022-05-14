@@ -125,6 +125,7 @@ class CLTrainer(Trainer):
         tasks = ['STSBenchmark', 'SICKRelatedness']
         if eval_senteval_transfer or self.args.eval_transfer:
             tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
+        # tasks = ['STSBenchmark']
         self.model.eval()
         results = se.eval(tasks)
         
@@ -198,6 +199,7 @@ class CLTrainer(Trainer):
         else:
             # Save model checkpoint
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            # checkpoint_folder = ""
 
             if self.hp_search_backend is not None and trial is not None:
                 if self.hp_search_backend == HPSearchBackend.OPTUNA:
@@ -461,7 +463,13 @@ class CLTrainer(Trainer):
                     with model.no_sync():
                         tr_loss += self.training_step(model, inputs)
                 else:
-                    tr_loss += self.training_step(model, inputs)
+                    try:
+                        tr_loss += self.training_step(model, inputs)
+                    except RuntimeError as e:
+                        print(e)
+                        continue
+                        # with model.no_sync():
+                        #     tr_loss += self.training_step(model, inputs)
                 self._total_flos += self.floating_point_ops(inputs)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
