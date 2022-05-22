@@ -83,13 +83,13 @@ class Pooler(nn.Module):
             raise NotImplementedError
 
 class Projector(nn.Module):
-    def __init__(self, config):
+    def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
         self.dense = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * 4),
-            nn.BatchNorm1d(config.hidden_size * 4),
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
             nn.ReLU(True),
-            nn.Linear(config.hidden_size * 4, config.hidden_size * 4),
+            nn.Linear(hidden_size, output_size),
         )
 
     def forward(self, features, **kwargs):
@@ -108,11 +108,16 @@ def cl_init(cls, config):
     """
     cls.pooler_type = cls.model_args.pooler_type
     cls.pooler = Pooler(cls.model_args.pooler_type)
-    if cls.model_args.pooler_type == "cls":
-        cls.mlp = MLPLayer(config)
+    # if cls.model_args.pooler_type == "cls":
+        # cls.mlp = MLPLayer(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
-    cls.projector = Projector(config)
+    cls.predictor = Projector(config.hidden_size//2, config.hidden_size*2, config.hidden_size//2)
     cls.init_weights()
+
+def regression_loss(x, y):
+        x = F.normalize(x, dim=1)
+        y = F.normalize(y, dim=1)
+        return 2 - 2 * (x * y).sum(dim=-1)
 
 def cl_forward(cls,
     encoder,
@@ -155,7 +160,7 @@ def cl_forward(cls,
         output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
         return_dict=True,
     )
-
+    
     # MLM auxiliary objective
     if mlm_input_ids is not None:
         mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
@@ -182,9 +187,36 @@ def cl_forward(cls,
 
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
-    z1 = cls.projector(z1)
-    z2 = cls.projector(z2)
+    z1 = cls.predictor(cls.projector(z1))
+    z2 = cls.predictor(cls.projector(z2))
 
+    with torch.no_grad():
+        target_outputs = cls.target_bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+            return_dict=True,
+        )
+        
+        # Pooling
+        target_pooler_output = cls.pooler(attention_mask, target_outputs)
+        target_pooler_output = target_pooler_output.view((batch_size, num_sent, target_pooler_output.size(-1))) # (bs, num_sent, hidden)
+
+        # If using "cls", we add an extra MLP layer
+        # (same as BERT's original implementation) over the representation.
+        if cls.pooler_type == "cls":
+            target_pooler_output = cls.target_mlp(target_pooler_output)
+
+        # Separate representation
+        target_z1, target_z2 = target_pooler_output[:,0], target_pooler_output[:,1]
+        target_z1 = cls.target_projector(target_z1)
+        target_z2 = cls.target_projector(target_z2)
+        
     # Hard negative
     if num_sent == 3:
         z3 = pooler_output[:, 2]
@@ -256,23 +288,29 @@ def cl_forward(cls,
     ### --- VICReg ---
 
     ### --- Barlow Twins ---
-    N, D = z1.size()
-    bn = torch.nn.BatchNorm1d(D, affine=False).to(z1.device)
-    c = bn(z1).T @ bn(z2)
-    c.div_(batch_size)
-    # c.div_(cls.model_args.temp)
-    if cl_forward.step % 125 == 0:
-        print(c)
-        print(cos_sim)
-    on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-    off_diag = off_diagonal(c).pow_(2).sum()
-    loss = on_diag + 0.03 * off_diag
-    loss *= 0.001
+    # N, D = z1.size()
+    # bn = torch.nn.BatchNorm1d(D, affine=False).to(z1.device)
+    # c = bn(z1).T @ bn(z2)
+    # c.div_(batch_size)
+    # # c.div_(cls.model_args.temp)
+    # if cl_forward.step % 125 == 0:
+    #     print(c)
+    #     print(cos_sim)
+    # on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+    # off_diag = off_diagonal(c).pow_(2).sum()
+    # loss = on_diag + 0.03 * off_diag
+    # loss *= 0.001
 
-    cl_forward.step += 1
-    if cl_forward.step % 125 == 0:
-        print({'on_diag' : on_diag.item(), 'off_diag' : off_diag.item(), 'weighted' : loss.item()})
+    # cl_forward.step += 1
+    # if cl_forward.step % 125 == 0:
+    #     print({'on_diag' : on_diag.item(), 'off_diag' : off_diag.item(), 'weighted' : loss.item()})
     ### --- Barlow Twins ---
+    
+    ### --- BYOL ---
+    loss = regression_loss(z1, target_z1)
+    loss += regression_loss(z2, target_z2)
+    ### --- BYOL ---
+    loss = loss.mean()
     
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
@@ -342,7 +380,22 @@ class BertForCL(BertPreTrainedModel):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
         self.bert = BertModel(config, add_pooling_layer=False)
+        self.mlp = MLPLayer(config)
+        self.projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size//2)
+        self.target_bert = BertModel(config, add_pooling_layer=False)
+        self.target_mlp = MLPLayer(config)
+        self.target_projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size//2)
 
+        for param_q, param_k in zip(self.bert.parameters(), self.target_bert.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        for param_q, param_k in zip(self.mlp.parameters(), self.target_mlp.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        for param_q, param_k in zip(self.projector.parameters(), self.target_projector.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        
         if self.model_args.do_mlm:
             self.lm_head = BertLMPredictionHead(config)
 

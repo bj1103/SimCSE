@@ -9,7 +9,7 @@ python train.py \
     --train_file data/wiki1m_for_simcse.txt \
     --output_dir /ssd/bj1103/SimCSE/exp \
     --num_train_epochs 2 \
-    --per_device_train_batch_size 256 \
+    --per_device_train_batch_size 128 \
     --learning_rate 3e-5 \
     --max_seq_length 32 \
     --evaluation_strategy steps \
