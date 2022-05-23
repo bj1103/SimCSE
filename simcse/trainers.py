@@ -427,7 +427,6 @@ class CLTrainer(Trainer):
 
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
 
-        self.m = 0.996
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
         if not self.args.ignore_data_skip:
             for epoch in range(epochs_trained):
@@ -506,13 +505,7 @@ class CLTrainer(Trainer):
                         self.optimizer.step()
                     
                     self.lr_scheduler.step()
-                    for param_q, param_k in zip(model.module.bert.parameters(), model.module.target_bert.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    for param_q, param_k in zip(model.module.mlp.parameters(), model.module.target_mlp.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    for param_q, param_k in zip(model.module.projector.parameters(), model.module.target_projector.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    
+                    model.module._momentum_update_key_encoder()
                     model.zero_grad()
 
                     self.state.global_step += 1

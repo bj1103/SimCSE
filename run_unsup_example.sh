@@ -8,7 +8,7 @@ python train.py \
     --model_name_or_path bert-base-uncased \
     --train_file data/wiki1m_for_simcse.txt \
     --output_dir /ssd/bj1103/SimCSE/exp \
-    --num_train_epochs 2 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 128 \
     --learning_rate 3e-5 \
     --max_seq_length 32 \
@@ -19,7 +19,7 @@ python train.py \
     --pooler_type cls \
     --mlp_only_train \
     --overwrite_output_dir \
-    --temp 0.05 \
+    --temp 0.07 \
     --do_train \
     --do_eval \
     --fp16 \

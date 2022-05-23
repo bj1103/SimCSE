@@ -87,7 +87,6 @@ class Projector(nn.Module):
         super().__init__()
         self.dense = nn.Sequential(
             nn.Linear(input_size, hidden_size),
-            nn.BatchNorm1d(hidden_size),
             nn.ReLU(True),
             nn.Linear(hidden_size, output_size),
         )
@@ -111,7 +110,7 @@ def cl_init(cls, config):
     # if cls.model_args.pooler_type == "cls":
         # cls.mlp = MLPLayer(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
-    cls.predictor = Projector(config.hidden_size//2, config.hidden_size*2, config.hidden_size//2)
+    # cls.predictor = Projector(config.hidden_size//2, config.hidden_size*2, config.hidden_size//2)
     cls.init_weights()
 
 def regression_loss(x, y):
@@ -187,10 +186,13 @@ def cl_forward(cls,
 
     # Separate representation
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
-    z1 = cls.predictor(cls.projector(z1))
-    z2 = cls.predictor(cls.projector(z2))
+    z1 = cls.projector(z1)
+    z2 = cls.projector(z2)
+    z1 = nn.functional.normalize(z1, dim=1)
+    z2 = nn.functional.normalize(z2, dim=1)
 
     with torch.no_grad():
+        # cls._momentum_update_key_encoder()
         target_outputs = cls.target_bert(
             input_ids,
             attention_mask=attention_mask,
@@ -216,6 +218,8 @@ def cl_forward(cls,
         target_z1, target_z2 = target_pooler_output[:,0], target_pooler_output[:,1]
         target_z1 = cls.target_projector(target_z1)
         target_z2 = cls.target_projector(target_z2)
+        target_z1 = nn.functional.normalize(target_z1, dim=1)
+        target_z2 = nn.functional.normalize(target_z2, dim=1)
         
     # Hard negative
     if num_sent == 3:
@@ -245,14 +249,14 @@ def cl_forward(cls,
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
 
-    cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))
+    cos_sim = cls.sim(z1.unsqueeze(1), target_z1.unsqueeze(0))
     # Hard negative
     if num_sent >= 3:
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
         cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
 
     # labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    # loss_fct = nn.CrossEntropyLoss()
+    loss_fct = nn.CrossEntropyLoss()
 
     # Calculate loss with hard negatives
     if num_sent == 3:
@@ -307,11 +311,21 @@ def cl_forward(cls,
     ### --- Barlow Twins ---
     
     ### --- BYOL ---
-    loss = regression_loss(z1, target_z1)
-    loss += regression_loss(z2, target_z2)
+    # loss = regression_loss(z1, target_z1)
+    # loss += regression_loss(z2, target_z2)
+    # loss = loss.mean()
     ### --- BYOL ---
-    loss = loss.mean()
-    
+
+    ### --- MoCo ---
+    l_pos = torch.einsum('nc,nc->n', [z1, target_z1]).unsqueeze(-1)
+    l_neg = torch.einsum('nc,ck->nk', [z1, cls.queue.clone().detach()])
+    logits = torch.cat([l_pos, l_neg], dim=1)
+    # logits /= cls.model_args.temp
+    labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+    loss = loss_fct(logits, labels)
+    cls._dequeue_and_enqueue(target_z1)
+    ### --- MoCo ---
+
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
@@ -379,12 +393,14 @@ class BertForCL(BertPreTrainedModel):
     def __init__(self, config, *model_args, **model_kargs):
         super().__init__(config)
         self.model_args = model_kargs["model_args"]
+        
         self.bert = BertModel(config, add_pooling_layer=False)
         self.mlp = MLPLayer(config)
-        self.projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size//2)
+        self.projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size)
+        
         self.target_bert = BertModel(config, add_pooling_layer=False)
         self.target_mlp = MLPLayer(config)
-        self.target_projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size//2)
+        self.target_projector = Projector(config.hidden_size, config.hidden_size*2, config.hidden_size)
 
         for param_q, param_k in zip(self.bert.parameters(), self.target_bert.parameters()):
             param_k.data.copy_(param_q.data)
@@ -398,9 +414,36 @@ class BertForCL(BertPreTrainedModel):
         
         if self.model_args.do_mlm:
             self.lm_head = BertLMPredictionHead(config)
-
+        
+        self.m = 0.999
+        self.K = 65536
+        self.register_buffer("queue", torch.randn(config.hidden_size, self.K))
+        self.queue = nn.functional.normalize(self.queue, dim=0)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         cl_init(self, config)
 
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        for param_q, param_k in zip(self.bert.parameters(), self.target_bert.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+        for param_q, param_k in zip(self.mlp.parameters(), self.target_mlp.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+        for param_q, param_k in zip(self.projector.parameters(), self.target_projector.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptr)
+        if ptr + batch_size <= self.K:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+        else:
+            out = ptr + batch_size - self.K
+            self.queue[:, ptr:self.K] = keys.T[:, :self.K - ptr]
+            self.queue[:, :out] = keys.T[:, self.K - ptr:]
+        ptr = (ptr + batch_size) % self.K
+        self.queue_ptr[0] = ptr
+         
     def forward(self,
         input_ids=None,
         attention_mask=None,
