@@ -506,13 +506,20 @@ class CLTrainer(Trainer):
                         self.optimizer.step()
                     
                     self.lr_scheduler.step()
-                    for param_q, param_k in zip(model.module.bert.parameters(), model.module.target_bert.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    for param_q, param_k in zip(model.module.mlp.parameters(), model.module.target_mlp.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    for param_q, param_k in zip(model.module.projector.parameters(), model.module.target_projector.parameters()):
-                        param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-                    
+                    if self.n_gpu > 1:
+                        for param_q, param_k in zip(model.module.bert.parameters(), model.module.target_bert.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                        for param_q, param_k in zip(model.module.mlp.parameters(), model.module.target_mlp.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                        for param_q, param_k in zip(model.module.projector.parameters(), model.module.target_projector.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                    else:
+                        for param_q, param_k in zip(model.bert.parameters(), model.target_bert.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                        for param_q, param_k in zip(model.mlp.parameters(), model.target_mlp.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+                        for param_q, param_k in zip(model.projector.parameters(), model.target_projector.parameters()):
+                            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
                     model.zero_grad()
 
                     self.state.global_step += 1
