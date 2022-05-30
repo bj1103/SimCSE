@@ -261,9 +261,6 @@ def cl_forward(cls,
     c = bn(z1).T @ bn(z2)
     c.div_(batch_size)
     # c.div_(cls.model_args.temp)
-    if cl_forward.step % 125 == 0:
-        print(c)
-        print(cos_sim)
     on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
     off_diag = off_diagonal(c).pow_(2).sum()
     loss = on_diag + 0.03 * off_diag
